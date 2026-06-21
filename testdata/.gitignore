@@ -1,0 +1,3 @@
+# Keep the testdata/ folder but never commit its contents (real ID scans).
+*
+!.gitignore
