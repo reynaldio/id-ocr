@@ -3,12 +3,14 @@ package googlevision
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"image"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/reynaldio/id-ocr/ocr"
 )
@@ -33,8 +35,11 @@ func TestRecognize_ParsesTextAndWords(t *testing.T) {
 
 	var gotReq annotateRequest
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.URL.Query().Get("key"); got != "secret" {
-			t.Errorf("api key = %q, want secret", got)
+		if got := r.Header.Get("X-Goog-Api-Key"); got != "secret" {
+			t.Errorf("X-Goog-Api-Key = %q, want secret", got)
+		}
+		if r.URL.RawQuery != "" {
+			t.Errorf("query = %q, want empty (key must not travel in the URL)", r.URL.RawQuery)
 		}
 		body, _ := io.ReadAll(r.Body)
 		if err := json.Unmarshal(body, &gotReq); err != nil {
@@ -107,5 +112,93 @@ func TestRecognize_NoCredentials(t *testing.T) {
 	_, err := New().Recognize(context.Background(), blankImage())
 	if err == nil || !strings.Contains(err.Error(), "no credentials") {
 		t.Fatalf("err = %v, want no-credentials error", err)
+	}
+}
+
+// The key must never surface in error text: consumers log and return these.
+const leakKey = "AIzaSy-super-secret-key"
+
+func TestRecognize_HTTPErrorHidesBodyAndKey(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A misbehaving proxy echoing the request back.
+		w.WriteHeader(http.StatusForbidden)
+		io.WriteString(w, `{"error":{"code":403,"message":"echo `+r.URL.String()+` `+r.Header.Get("X-Goog-Api-Key")+`","status":"PERMISSION_DENIED"}}`)
+	}))
+	defer srv.Close()
+
+	_, err := New(WithAPIKey(leakKey), WithEndpoint(srv.URL)).Recognize(context.Background(), blankImage())
+	if err == nil {
+		t.Fatal("want error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "403") || !strings.Contains(msg, "PERMISSION_DENIED") {
+		t.Errorf("err = %q, want HTTP 403 PERMISSION_DENIED", msg)
+	}
+	if strings.Contains(msg, leakKey) || strings.Contains(msg, "echo") {
+		t.Errorf("err leaks response body or key: %q", msg)
+	}
+}
+
+func TestRecognize_HTTPErrorUnparsableBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		io.WriteString(w, "<html>gateway saw key="+leakKey+"</html>")
+	}))
+	defer srv.Close()
+
+	_, err := New(WithAPIKey(leakKey), WithEndpoint(srv.URL)).Recognize(context.Background(), blankImage())
+	if err == nil || err.Error() != "googlevision: HTTP 502" {
+		t.Fatalf("err = %v, want googlevision: HTTP 502", err)
+	}
+}
+
+func TestRecognize_TransportErrorHidesKey(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	endpoint := srv.URL
+	srv.Close() // connection refused from here on
+
+	_, err := New(WithAPIKey(leakKey), WithEndpoint(endpoint)).Recognize(context.Background(), blankImage())
+	if err == nil {
+		t.Fatal("want error")
+	}
+	if strings.Contains(err.Error(), leakKey) {
+		t.Errorf("err leaks key: %q", err)
+	}
+}
+
+func TestRecognize_TimeoutKeepsContextErrorAndHidesKey(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-release }))
+	defer srv.Close()
+	defer close(release)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err := New(WithAPIKey(leakKey), WithEndpoint(srv.URL)).Recognize(ctx, blankImage())
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+	}
+	if strings.Contains(err.Error(), leakKey) {
+		t.Errorf("err leaks key: %q", err)
+	}
+}
+
+func TestRecognize_DoesNotFollowRedirects(t *testing.T) {
+	var leaked bool
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leaked = r.Header.Get("X-Goog-Api-Key") != ""
+	}))
+	defer other.Close()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL, http.StatusTemporaryRedirect)
+	}))
+	defer srv.Close()
+
+	_, err := New(WithAPIKey(leakKey), WithEndpoint(srv.URL)).Recognize(context.Background(), blankImage())
+	if err == nil {
+		t.Fatal("want error for a redirect response")
+	}
+	if leaked {
+		t.Error("API key header was forwarded to the redirect target")
 	}
 }

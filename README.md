@@ -33,7 +33,7 @@ image ──▶ ocr.Engine ──▶ ocr.Result(text) ──▶ <doc>.Parse ─�
 ## Install
 
 ```sh
-go get github.com/reynaldio/id-ocr@v0.2.0
+go get github.com/reynaldio/id-ocr@v0.2.1
 ```
 
 ## Usage
@@ -237,9 +237,9 @@ Every document exposes `Validate() error`:
 ## Versioning
 
 Follows [Semantic Versioning](https://semver.org). The current version is
-**v0.2.0**, exposed as [`idocr.Version`](version.go) and mirroring the published
+**v0.2.1**, exposed as [`idocr.Version`](version.go) and mirroring the published
 git tag. The Tesseract submodule is tagged in parallel
-(`ocr/tesseract/v0.2.0`). While on `v0.x` the public API may change between
+(`ocr/tesseract/v0.2.1`). While on `v0.x` the public API may change between
 minor releases.
 
 ## Development

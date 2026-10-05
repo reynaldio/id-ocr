@@ -5,4 +5,4 @@ package idocr
 //
 // The library follows Semantic Versioning (https://semver.org). While the
 // major version is 0 the public API may change between minor releases.
-const Version = "0.2.0"
+const Version = "0.2.1"

@@ -6,9 +6,10 @@
 // recommended engine for KTP and passport accuracy, where local OCR is
 // unreliable.
 //
-// Authentication is either an API key (query parameter) or an OAuth2 bearer
-// token (Authorization header), e.g. the output of
-// `gcloud auth application-default print-access-token`:
+// Authentication is either an API key (X-Goog-Api-Key header) or an OAuth2
+// bearer token (Authorization header), e.g. the output of
+// `gcloud auth application-default print-access-token`. Credentials never
+// travel in the URL and never appear in returned errors:
 //
 //	engine := googlevision.New(googlevision.WithAPIKey(os.Getenv("GOOGLE_VISION_API_KEY")))
 //	// or
@@ -20,12 +21,14 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"image"
 	"image/png"
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/reynaldio/id-ocr/ocr"
 )
@@ -66,7 +69,9 @@ func WithLanguageHints(langs ...string) Option {
 	return func(e *Engine) { e.langHints = langs }
 }
 
-// WithHTTPClient sets the HTTP client used for requests.
+// WithHTTPClient sets the HTTP client used for requests. The default client
+// refuses redirects so credential headers are never forwarded to another
+// host; a custom client's redirect policy is its own.
 func WithHTTPClient(c *http.Client) Option { return func(e *Engine) { e.httpClient = c } }
 
 // New returns a Vision engine. Provide WithAPIKey or WithBearerToken for
@@ -75,7 +80,7 @@ func New(opts ...Option) *Engine {
 	e := &Engine{
 		endpoint:   defaultEndpoint,
 		feature:    "DOCUMENT_TEXT_DETECTION",
-		httpClient: http.DefaultClient,
+		httpClient: &http.Client{CheckRedirect: noRedirect},
 	}
 	for _, o := range opts {
 		o(e)
@@ -104,19 +109,80 @@ func (e *Engine) Recognize(ctx context.Context, img image.Image) (*ocr.Result, e
 	}
 	resp, err := e.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("googlevision: request failed: %w", err)
+		// *url.Error prints the request URL; keep only the cause (still
+		// unwrappable, e.g. to context.DeadlineExceeded).
+		var ue *url.Error
+		if errors.As(err, &ue) {
+			err = ue.Err
+		}
+		return nil, e.redact(fmt.Errorf("googlevision: request failed: %w", err))
 	}
 	defer resp.Body.Close()
 
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, e.redact(fmt.Errorf("googlevision: read response: %w", err))
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("googlevision: HTTP %d: %s", resp.StatusCode, truncate(raw))
+		return nil, httpError(resp.StatusCode, raw)
 	}
 	return parseResult(raw)
 }
+
+// httpError reports a non-200 response by status code and Google's error
+// status (e.g. PERMISSION_DENIED) only. The body is untrusted — a proxy may
+// echo the request — so free text from it is never included.
+func httpError(code int, raw []byte) error {
+	var env struct {
+		Error struct {
+			Status string `json:"status"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(raw, &env) == nil && isStatusCode(env.Error.Status) {
+		return fmt.Errorf("googlevision: HTTP %d %s", code, env.Error.Status)
+	}
+	return fmt.Errorf("googlevision: HTTP %d", code)
+}
+
+// isStatusCode reports whether s looks like a google.rpc.Code name
+// (UPPER_SNAKE_CASE), so arbitrary text can't ride along in the status field.
+func isStatusCode(s string) bool {
+	if s == "" || len(s) > 64 {
+		return false
+	}
+	for _, r := range s {
+		if (r < 'A' || r > 'Z') && r != '_' {
+			return false
+		}
+	}
+	return true
+}
+
+// redact is a last line of defence: it blanks credentials from err's text
+// while keeping err unwrappable.
+func (e *Engine) redact(err error) error {
+	msg := err.Error()
+	clean := msg
+	for _, secret := range []string{e.apiKey, e.bearerToken} {
+		if secret != "" {
+			clean = strings.ReplaceAll(clean, secret, "[REDACTED]")
+		}
+	}
+	if clean == msg {
+		return err
+	}
+	return &redactedError{msg: clean, err: err}
+}
+
+type redactedError struct {
+	msg string
+	err error
+}
+
+func (r *redactedError) Error() string { return r.msg }
+func (r *redactedError) Unwrap() error { return r.err }
+
+func noRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
 func (e *Engine) buildRequest(imgData []byte) annotateRequest {
 	r := annotateRequest{Requests: []annotateImageRequest{{
@@ -130,15 +196,14 @@ func (e *Engine) buildRequest(imgData []byte) annotateRequest {
 }
 
 func (e *Engine) newHTTPRequest(ctx context.Context, body []byte) (*http.Request, error) {
-	endpoint := e.endpoint
-	if e.apiKey != "" {
-		endpoint += "?key=" + url.QueryEscape(e.apiKey)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, e.endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if e.apiKey != "" {
+		req.Header.Set("X-Goog-Api-Key", e.apiKey)
+	}
 	if e.bearerToken != "" {
 		req.Header.Set("Authorization", "Bearer "+e.bearerToken)
 	}
@@ -150,12 +215,4 @@ func encodePNG(buf *bytes.Buffer, img image.Image) error {
 		return fmt.Errorf("googlevision: encode image: %w", err)
 	}
 	return nil
-}
-
-func truncate(b []byte) string {
-	const max = 512
-	if len(b) > max {
-		return string(b[:max]) + "…"
-	}
-	return string(b)
 }

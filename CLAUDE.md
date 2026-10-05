@@ -108,6 +108,6 @@ local for dev.
 
 ## Versioning
 
-SemVer. Current: **v0.2.0**. Bump `Version` in `version.go`, the Tesseract
+SemVer. Current: **v0.2.1**. Bump `Version` in `version.go`, the Tesseract
 submodule's core `require`, and tag both `vX.Y.Z` and `ocr/tesseract/vX.Y.Z`
 together. On `v0.x` the API may break between minor versions.
